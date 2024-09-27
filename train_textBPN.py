@@ -8,7 +8,7 @@ import torch.backends.cudnn as cudnn
 import torch.utils.data as data
 from torch.optim import lr_scheduler
 from torch.utils.data import ConcatDataset
-
+from lightning.pytorch.utilities import CombinedLoader
 from dataset import SynthText, TotalText, Ctw1500Text, Icdar15Text, LsvtTextJson,\
     Mlt2017Text, TD500Text, ArtTextJson, Mlt2019Text, Ctw1500Text_New, TotalText_New, ArtText
 from network.loss import TextLoss
@@ -67,7 +67,41 @@ def _parse_data(inputs):
     return input_dict
 
 
-def train(model, train_loader, criterion, scheduler, optimizer, epoch):
+def train_loop(model, criterion, scheduler, optimizer, epoch, inputs, losses, i, train_loader):
+    input_dict = _parse_data(inputs)
+    output_dict = model(input_dict)
+    loss_dict = criterion(input_dict, output_dict, eps=epoch+1)
+    loss = loss_dict["total_loss"]
+    # backward
+    try:
+        optimizer.zero_grad()
+        loss.backward()
+    except:
+        print("loss gg")
+        return model, criterion, scheduler, optimizer, epoch, losses
+    if cfg.grad_clip > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+
+    optimizer.step()
+
+    losses.update(loss.item())
+    # measure elapsed time
+    # batch_time.update(time.time() - end)
+    # end = time.time()
+
+    if cfg.viz and (i % cfg.viz_freq == 0 and i > 0) and epoch % 8 == 0:
+        visualize_network_output(output_dict, input_dict, mode='train')
+
+    if i % cfg.display_freq == 0:
+        gc.collect()
+        print_inform = "({:d} / {:d}) ".format(i, len(train_loader))
+        for (k, v) in loss_dict.items():
+            print_inform += " {}: {:.4f} ".format(k, v.item())
+        print(print_inform)
+
+    return model, criterion, scheduler, optimizer, epoch, losses
+
+def train(model, train_loader, criterion, scheduler, optimizer, epoch, combined_loader=None):
 
     global train_step
 
@@ -80,40 +114,55 @@ def train(model, train_loader, criterion, scheduler, optimizer, epoch):
 
     print('Epoch: {} : LR = {}'.format(epoch, scheduler.get_lr()))
 
-    for i, inputs in enumerate(train_loader):
+    if combined_loader is not None:
+        for batch, batch_idx, dataloader_idx in combined_loader:
+            for inputs in batch.values():
+                if not inputs:
+                    continue
+                model, criterion, scheduler, optimizer, epoch, losses = train_loop(model, 
+                criterion, scheduler, optimizer, epoch, inputs, losses, i, train_loader)
 
-        data_time.update(time.time() - end)
-        train_step += 1
-        input_dict = _parse_data(inputs)
-        output_dict = model(input_dict)
-        loss_dict = criterion(input_dict, output_dict, eps=epoch+1)
-        loss = loss_dict["total_loss"]
-        # backward
-        try:
-            optimizer.zero_grad()
-            loss.backward()
-        except:
-            print("loss gg")
-            continue
-        if cfg.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+    else:
+        for i, inputs in enumerate(train_loader):
+            model, criterion, scheduler, optimizer, epoch, losses = train_loop(model, 
+            criterion, scheduler, optimizer, epoch, inputs, losses, i, train_loader)
 
-        optimizer.step()
 
-        losses.update(loss.item())
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
 
-        if cfg.viz and (i % cfg.viz_freq == 0 and i > 0) and epoch % 8 == 0:
-            visualize_network_output(output_dict, input_dict, mode='train')
+    # for i, inputs in enumerate(train_loader):
 
-        if i % cfg.display_freq == 0:
-            gc.collect()
-            print_inform = "({:d} / {:d}) ".format(i, len(train_loader))
-            for (k, v) in loss_dict.items():
-                print_inform += " {}: {:.4f} ".format(k, v.item())
-            print(print_inform)
+    #     data_time.update(time.time() - end)
+    #     train_step += 1
+    #     input_dict = _parse_data(inputs)
+    #     output_dict = model(input_dict)
+    #     loss_dict = criterion(input_dict, output_dict, eps=epoch+1)
+    #     loss = loss_dict["total_loss"]
+    #     # backward
+    #     try:
+    #         optimizer.zero_grad()
+    #         loss.backward()
+    #     except:
+    #         print("loss gg")
+    #         continue
+    #     if cfg.grad_clip > 0:
+    #         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+
+    #     optimizer.step()
+
+    #     losses.update(loss.item())
+    #     # measure elapsed time
+    #     batch_time.update(time.time() - end)
+    #     end = time.time()
+
+    #     if cfg.viz and (i % cfg.viz_freq == 0 and i > 0) and epoch % 8 == 0:
+    #         visualize_network_output(output_dict, input_dict, mode='train')
+
+    #     if i % cfg.display_freq == 0:
+    #         gc.collect()
+    #         print_inform = "({:d} / {:d}) ".format(i, len(train_loader))
+    #         for (k, v) in loss_dict.items():
+    #             print_inform += " {}: {:.4f} ".format(k, v.item())
+    #         print(print_inform)
 
     if cfg.exp_name == 'Synthtext' or cfg.exp_name == 'ALL':
         if epoch % cfg.save_freq == 0:
@@ -126,7 +175,8 @@ def train(model, train_loader, criterion, scheduler, optimizer, epoch):
             if epoch % cfg.save_freq == 0:
                 save_model(model, epoch, scheduler.get_lr(), optimizer)
     else:
-        if epoch % cfg.save_freq == 0 and epoch > 50:
+        # if epoch % cfg.save_freq == 0 and epoch > 50:
+        if epoch % cfg.save_freq == 0:
             save_model(model, epoch, scheduler.get_lr(), optimizer)
 
     print('Training Loss: {}'.format(losses.avg))
@@ -137,7 +187,7 @@ def main():
     global lr
     if cfg.exp_name == 'Totaltext':
         trainset = TotalText(
-            data_root='data/total-text-mat',
+            data_root='/ssd_scratch/cvit/saumya/total-text-mat',
             ignore_list=None,
             is_training=True,
             load_memory=cfg.load_memory,
@@ -155,8 +205,16 @@ def main():
         valset = None
 
     elif cfg.exp_name == 'Ctw1500':
-        trainset = Ctw1500Text(
-            data_root='data/ctw1500',
+        # trainset = Ctw1500Text(
+        #     # data_root='data/ctw1500',
+        #     data_root='/ssd_scratch/cvit/saumya/ctw1500',
+        #     is_training=True,
+        #     load_memory=cfg.load_memory,
+        #     transform=Augmentation(size=cfg.input_size, mean=cfg.means, std=cfg.stds)
+        # )
+        trainset = Ctw1500Text_New(
+            # data_root='data/ctw1500',
+            data_root='/ssd_scratch/cvit/saumya/ctw1500',
             is_training=True,
             load_memory=cfg.load_memory,
             transform=Augmentation(size=cfg.input_size, mean=cfg.means, std=cfg.stds)
@@ -230,10 +288,27 @@ def main():
     else:
         print("dataset name is not correct")
 
-    train_loader = data.DataLoader(trainset, batch_size=cfg.batch_size,
+    cfg.batch_size = 4
+    ctw_trainset = Ctw1500Text_New(
+    # data_root='data/ctw1500',
+    data_root='/ssd_scratch/cvit/saumya/ctw1500',
+    is_training=True,
+    load_memory=cfg.load_memory,
+    transform=Augmentation(size=cfg.input_size, mean=cfg.means, std=cfg.stds))
+    train_loader = data.DataLoader(ctw_trainset, batch_size=cfg.batch_size,
                                    shuffle=True, num_workers=cfg.num_workers,
-                                   pin_memory=True)  # generator=torch.Generator(device=cfg.device)
+                                   pin_memory=True, generator=torch.Generator(device=cfg.device))
 
+    tt_trainset = TotalText_New(
+        data_root='/ssd_scratch/cvit/saumya/total-text-mat',
+        ignore_list=None,
+        is_training=True,
+        load_memory=cfg.load_memory,
+        transform=Augmentation(size=cfg.input_size, mean=cfg.means, std=cfg.stds))
+    valset = None
+    
+    iterables = {'ctw': ctw_trainset, 'tt': tt_trainset}
+    combined_loader = CombinedLoader(iterables, 'max_size')
     # Model
     model = TextNet(backbone=cfg.net, is_training=True)
     model = model.to(cfg.device)
@@ -258,11 +333,15 @@ def main():
         scheduler = lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.9)
 
     print('Start training TextBPN++.')
+    cfg.combined = False
     for epoch in range(cfg.start_epoch, cfg.max_epoch+1):
         scheduler.step()
         # if epoch <= 300:
         #     continue
-        train(model, train_loader, criterion, scheduler, optimizer, epoch)
+        if cfg.combined:
+            train(model, train_loader, criterion, scheduler, optimizer, epoch, combined_loader=combined_loader)
+        else:
+            train(model, train_loader, criterion, scheduler, optimizer, epoch)
 
     print('End.')
 
